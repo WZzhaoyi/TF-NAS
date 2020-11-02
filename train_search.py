@@ -24,7 +24,8 @@ from models.model_search import Network
 from parsing_model import get_op_and_depth_weights
 from parsing_model import parse_architecture
 from parsing_model import get_mc_num_dddict
-from dataset import ImageList, IMAGENET_MEAN, IMAGENET_STD
+from dataset import get_segmentation_dataset
+from dataset import make_data_sampler
 
 parser = argparse.ArgumentParser("searching TF-NAS")
 # various path
@@ -52,11 +53,13 @@ parser.add_argument('--a_beta2', type=float, default=0.999, help='beta2 for arch
 parser.add_argument('--grad_clip', type=float, default=5.0, help='gradient clipping')
 parser.add_argument('--T', type=float, default=5.0, help='temperature for gumbel softmax')
 parser.add_argument('--T_decay', type=float, default=0.96, help='temperature decay')
-parser.add_argument('--num_classes', type=int, default=100, help='class number of training set')
+parser.add_argument('--num_classes', type=int, default=19, help='class number of training set')
 
 # others
 parser.add_argument('--seed', type=int, default=2, help='random seed')
 parser.add_argument('--note', type=str, default='try', help='note for this run')
+parser.add_argument('--distributed', type=int, default=0, help='distributed')
+parser.add_argument('--num_gpus', type=int, default=1, help='number of gpus')
 
 # hyper parameters
 parser.add_argument('--lambda_lat', type=float, default=0.1, help='trade off for latency')
@@ -121,36 +124,29 @@ def main():
 	criterion = nn.CrossEntropyLoss()
 	criterion = criterion.cuda()
 
-	normalize = transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
-	train_transform = transforms.Compose([
-			transforms.RandomResizedCrop(224),
-			transforms.RandomHorizontalFlip(),
-			transforms.ColorJitter(
-				brightness=0.4,
-				contrast=0.4,
-				saturation=0.4,
-				hue=0.2),
-			transforms.ToTensor(),
-			normalize,
-		])
-	val_transform = transforms.Compose([
-			transforms.Resize(256),
-			transforms.CenterCrop(224),
-			transforms.ToTensor(),
-			normalize,
-		])
+	input_transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ])
+	data_kwargs = {'transform': input_transform, 'base_size': 1024, 'crop_size': (512, 1024)}
+    train_dataset = get_segmentation_dataset(split='train', mode='train', **data_kwargs)
+    val_dataset = get_segmentation_dataset(split='val', mode='testval', **data_kwargs)
 
+	iters_per_epoch = len(train_dataset) // (args.num_gpus * args.batch_size)
+	max_iters = args.epochs * iters_per_epoch
+
+	train_sampler = make_data_sampler(train_dataset, shuffle=True, distributed=args.distributed)
+    train_batch_sampler = make_batch_data_sampler(train_sampler, args.batch_size, self.max_iters, drop_last=True)
+    val_sampler = make_data_sampler(val_dataset, shuffle=False, args.distributed)
+    val_batch_sampler = make_batch_data_sampler(val_sampler, args.batch_size, drop_last=False)
+	
 	train_queue = torch.utils.data.DataLoader(
-		ImageList(root=args.img_root, 
-				  list_path=args.train_list, 
-				  transform=train_transform), 
-		batch_size=args.batch_size, shuffle=True, pin_memory=True, num_workers=args.workers)
+		dataset=train_dataset,
+		batch_sampler=train_batch_sampler, shuffle=True, pin_memory=True, num_workers=args.workers)
 
 	val_queue = torch.utils.data.DataLoader(
-		ImageList(root=args.img_root, 
-				  list_path=args.val_list, 
-				  transform=val_transform), 
-		batch_size=args.batch_size, shuffle=True, pin_memory=True, num_workers=args.workers)
+		dataset=val_dataset,
+		batch_sampler=val_batch_sampler, shuffle=True, pin_memory=True, num_workers=args.workers)
 
 	for epoch in range(args.epochs):
 		mc_num_dddict = get_mc_num_dddict(mc_mask_dddict)
