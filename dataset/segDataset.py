@@ -11,7 +11,7 @@ from PIL import Image, ImageOps, ImageFilter
 
 __all__ = ['SegmentationDataset', 'CitySegmentation', 'get_segmentation_dataset']
 
-def get_segmentation_dataset(name, **kwargs):
+def get_segmentation_dataset(**kwargs):
     """Segmentation Datasets"""
     return CitySegmentation(**kwargs)
 
@@ -20,7 +20,7 @@ class SegmentationDataset(object):
 
     def __init__(self, root, split, mode, transform, base_size=1024, crop_size=(512, 1024)):
         super(SegmentationDataset, self).__init__()
-        self.root = os.path.join('', root)
+        self.root = os.path.join('../SegmenTron/', root)
         self.transform = transform
         self.split = split
         self.mode = mode if mode is not None else split

@@ -15,21 +15,23 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.backends.cudnn as cudnn
 import torchvision.transforms as transforms
+from tensorboardX import SummaryWriter
 
 from tools.utils import AverageMeter, accuracy
 from tools.utils import count_parameters_in_MB
 from tools.utils import create_exp_dir
 from tools.config import mc_mask_dddict, lat_lookup_key_dddict
-from models.model_search import Network
+from models.seg_model_search import Network
 from parsing_model import get_op_and_depth_weights
 from parsing_model import parse_architecture
 from parsing_model import get_mc_num_dddict
 from dataset import get_segmentation_dataset
 from dataset import make_data_sampler
+from dataset import make_batch_data_sampler
 
 parser = argparse.ArgumentParser("searching TF-NAS")
 # various path
-parser.add_argument('--img_root', type=str, required=True, help='image root path (ImageNet train set)')
+parser.add_argument('--img_root', type=str, help='image root path (ImageNet train set)')
 parser.add_argument('--train_list', type=str, default="./dataset/ImageNet-100-effb0_train_cls_ratio0.8.txt",
 					help='training image list')
 parser.add_argument('--val_list', type=str, default="./dataset/ImageNet-100-effb0_val_cls_ratio0.8.txt",
@@ -42,7 +44,7 @@ parser.add_argument('--save', type=str, default='./checkpoints', help='model and
 parser.add_argument('--print_freq', type=float, default=100, help='print frequency')
 parser.add_argument('--workers', type=int, default=4, help='number of workers to load dataset')
 parser.add_argument('--epochs', type=int, default=90, help='num of total training epochs')
-parser.add_argument('--batch_size', type=int, default=32, help='batch size')
+parser.add_argument('--batch_size', type=int, default=16, help='batch size')
 parser.add_argument('--w_lr', type=float, default=0.025, help='learning rate for weights')
 parser.add_argument('--w_mom', type=float, default=0.9, help='momentum for weights')
 parser.add_argument('--w_wd', type=float, default=1e-5, help='weight decay for weights')
@@ -78,6 +80,7 @@ fh = logging.FileHandler(os.path.join(args.save, 'log.txt'))
 fh.setFormatter(logging.Formatter(log_format))
 logging.getLogger().addHandler(fh)
 
+writer = SummaryWriter(logdir=os.path.join(args.save, 'log'))
 
 def main():
 	if not torch.cuda.is_available():
@@ -129,24 +132,24 @@ def main():
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
         ])
 	data_kwargs = {'transform': input_transform, 'base_size': 1024, 'crop_size': (512, 1024)}
-    train_dataset = get_segmentation_dataset(split='train', mode='train', **data_kwargs)
-    val_dataset = get_segmentation_dataset(split='val', mode='testval', **data_kwargs)
+	train_dataset = get_segmentation_dataset(split='train', mode='train', **data_kwargs)
+	val_dataset = get_segmentation_dataset(split='val', mode='testval', **data_kwargs)
 
 	iters_per_epoch = len(train_dataset) // (args.num_gpus * args.batch_size)
 	max_iters = args.epochs * iters_per_epoch
 
 	train_sampler = make_data_sampler(train_dataset, shuffle=True, distributed=args.distributed)
-    train_batch_sampler = make_batch_data_sampler(train_sampler, args.batch_size, self.max_iters, drop_last=True)
-    val_sampler = make_data_sampler(val_dataset, shuffle=False, args.distributed)
-    val_batch_sampler = make_batch_data_sampler(val_sampler, args.batch_size, drop_last=False)
+	train_batch_sampler = make_batch_data_sampler(train_sampler, args.batch_size, max_iters, drop_last=True)
+	val_sampler = make_data_sampler(val_dataset, shuffle=False, distributed=args.distributed)
+	val_batch_sampler = make_batch_data_sampler(val_sampler, args.batch_size, drop_last=False)
 	
 	train_queue = torch.utils.data.DataLoader(
 		dataset=train_dataset,
-		batch_sampler=train_batch_sampler, shuffle=True, pin_memory=True, num_workers=args.workers)
+		batch_sampler=train_batch_sampler, pin_memory=True, num_workers=args.workers)
 
 	val_queue = torch.utils.data.DataLoader(
 		dataset=val_dataset,
-		batch_sampler=val_batch_sampler, shuffle=True, pin_memory=True, num_workers=args.workers)
+		batch_sampler=val_batch_sampler, pin_memory=True, num_workers=args.workers)
 
 	for epoch in range(args.epochs):
 		mc_num_dddict = get_mc_num_dddict(mc_mask_dddict)
@@ -221,11 +224,13 @@ def main():
 		logging.info('Train_acc %f', train_acc)
 		epoch_duration = time.time() - epoch_start
 		logging.info('Epoch time: %ds', epoch_duration)
+		writer.add_scalar('Train/train_acc', train_acc, epoch)
 
 		# validation for last 5 epochs
-		if args.epochs - epoch < 5:
+		if args.epochs - epoch < 10:
 			val_acc = validate(val_queue, model, criterion)
 			logging.info('Val_acc %f', val_acc)
+			writer.add_scalar('Train/val_acc', val_acc, 5 - (args.epochs - epoch))
 
 		# update state_dict
 		state_dict_from_model = model.state_dict()
@@ -323,7 +328,7 @@ def train_wo_arch(train_queue, model, criterion, optimizer_w):
 	for param in model.module.arch_parameters():
 		param.requires_grad = False
 
-	for step, (x_w, target_w) in enumerate(train_queue):
+	for step, (x_w, target_w, _) in enumerate(train_queue):
 		x_w = x_w.cuda(non_blocking=True)
 		target_w = target_w.cuda(non_blocking=True)
 

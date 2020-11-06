@@ -220,8 +220,8 @@ class Network(nn.Module):
 		self.first_stem  = LearningToDownsample(32, 48, 64)
 
 		self.stage1 = MixedStage(
-							ics  = [64,64],
-							ocs  = [64,64],
+							ics  = [64,80],
+							ocs  = [80,80],
 							ss   = [2,1],
 							affs = [False, False],
 							acts = ['relu', 'relu'],
@@ -229,7 +229,7 @@ class Network(nn.Module):
 							lat_lookup = lat_lookup,
 							stage_type = 1,)
 		self.stage2 = MixedStage(
-							ics  = [64,96,96],
+							ics  = [80,96,96],
 							ocs  = [96,96,96],
 							ss   = [2,1,1],
 							affs = [False, False, False],

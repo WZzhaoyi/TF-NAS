@@ -1,5 +1,5 @@
 import os
-import cv2
+# import cv2
 from PIL import Image
 import torch.utils.data as data
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
@@ -10,11 +10,11 @@ def pil_loader(path):
 	img = Image.open(path).convert('RGB')
 	return img
 
-def cv2_loader(path):
-	img = cv2.imread(path, cv2.IMREAD_COLOR)
-	img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-	img = Image.fromarray(img)
-	return img
+# def cv2_loader(path):
+# 	img = cv2.imread(path, cv2.IMREAD_COLOR)
+# 	img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+# 	img = Image.fromarray(img)
+# 	return img
 
 default_loader = pil_loader
 
