@@ -1,0 +1,6 @@
+flake8==3.8.3
+numpy==1.18.1
+Pillow==7.0.0
+tensorboardX==2.0
+torch==1.4.0
+torchvision==0.5.0

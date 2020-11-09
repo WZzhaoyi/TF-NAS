@@ -86,6 +86,7 @@ class MixedOP(nn.Module):
 			return op(x), 0
 		else:
 			weights = F.gumbel_softmax(self.log_alphas, self.T, hard=False)
+			# size of val_img = 1024*2048(mode = valtest)
 			lats = self.get_lookup_latency(x.size(-1))
 			out = sum(w*op(x) for w, op in zip(weights, self.m_ops))
 			out_lat = sum(w*lat for w, lat in zip(weights, lats))
@@ -433,14 +434,14 @@ class FeatureFusionModule(nn.Module):
         super(FeatureFusionModule, self).__init__()
         self.scale_factor = scale_factor
         self.dwconv = _ConvBNReLU(lower_in_channels, out_channels, 1, norm_layer=norm_layer)
-        self.conv_lower_res = nn.Sequential(
-            nn.Conv2d(out_channels, out_channels, 1),
-            norm_layer(out_channels)
-        )
-        self.conv_higher_res = nn.Sequential(
-            nn.Conv2d(highter_in_channels, out_channels, 1),
-            norm_layer(out_channels)
-        )
+        self.conv_lower_res = nn.Sequential(OrderedDict([
+			('conv1',nn.Conv2d(out_channels, out_channels, 1)),
+			('norm',norm_layer(out_channels))
+		]))
+        self.conv_higher_res = nn.Sequential(OrderedDict([
+			('conv1',nn.Conv2d(highter_in_channels, out_channels, 1)),
+			('norm',norm_layer(out_channels))
+		]))
         self.relu = nn.ReLU(True)
 
     def forward(self, higher_res_feature, lower_res_feature):
@@ -462,10 +463,10 @@ class Classifer(nn.Module):
                                        norm_layer=norm_layer)
         self.dsconv2 = SeparableConv2d(dw_channels, dw_channels, stride=stride, relu_first=False,
                                        norm_layer=norm_layer)
-        self.conv = nn.Sequential(
-            nn.Dropout2d(0.1),
-            nn.Conv2d(dw_channels, num_classes, 1)
-        )
+        self.conv = nn.Sequential(OrderedDict([
+			('dropout', nn.Dropout2d(0.1)),
+			('conv1', nn.Conv2d(dw_channels, num_classes, 1))
+		]))
 
     def forward(self, x):
         x = self.dsconv1(x)

@@ -8,16 +8,18 @@ import pickle
 import copy
 import numpy as np
 import warnings
+import datetime
 warnings.filterwarnings('ignore')
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.backends.cudnn as cudnn
+import torch.distributed as dist
 import torchvision.transforms as transforms
 from tensorboardX import SummaryWriter
 
-from tools.utils import AverageMeter, accuracy
+from tools.utils import AverageMeter, accuracy, SegmentationMetric
 from tools.utils import count_parameters_in_MB
 from tools.utils import create_exp_dir
 from tools.config import mc_mask_dddict, lat_lookup_key_dddict
@@ -28,6 +30,8 @@ from parsing_model import get_mc_num_dddict
 from dataset import get_segmentation_dataset
 from dataset import make_data_sampler
 from dataset import make_batch_data_sampler
+from loss import MixSoftmaxCrossEntropyLoss
+from loss import reduce_loss_dict
 
 parser = argparse.ArgumentParser("searching TF-NAS")
 # various path
@@ -43,7 +47,7 @@ parser.add_argument('--save', type=str, default='./checkpoints', help='model and
 # training hyper-parameters
 parser.add_argument('--print_freq', type=float, default=100, help='print frequency')
 parser.add_argument('--workers', type=int, default=4, help='number of workers to load dataset')
-parser.add_argument('--epochs', type=int, default=90, help='num of total training epochs')
+parser.add_argument('--epochs', type=int, default=50, help='num of total training epochs')
 parser.add_argument('--batch_size', type=int, default=16, help='batch size')
 parser.add_argument('--w_lr', type=float, default=0.025, help='learning rate for weights')
 parser.add_argument('--w_mom', type=float, default=0.9, help='momentum for weights')
@@ -62,6 +66,9 @@ parser.add_argument('--seed', type=int, default=2, help='random seed')
 parser.add_argument('--note', type=str, default='try', help='note for this run')
 parser.add_argument('--distributed', type=int, default=0, help='distributed')
 parser.add_argument('--num_gpus', type=int, default=1, help='number of gpus')
+parser.add_argument('--rank', default=0, help='rank of current process')
+parser.add_argument('--word_size', default=1, type=int, help="word size")
+parser.add_argument('--init_method', default='tcp://127.0.0.1:23456', help="init-method")
 
 # hyper parameters
 parser.add_argument('--lambda_lat', type=float, default=0.1, help='trade off for latency')
@@ -97,6 +104,8 @@ def main():
 		lat_lookup = pickle.load(f)
 
 	mc_maxnum_dddict = get_mc_num_dddict(mc_mask_dddict, is_max=True)
+	if args.distributed or args.num_gpus > 1:
+		dist.init_process_group(backend='nccl', init_method=args.init_method, rank=args.rank, world_size=args.word_size)
 	model = Network(args.num_classes, mc_maxnum_dddict, lat_lookup)
 	model = torch.nn.DataParallel(model).cuda()
 	logging.info("param size = %fMB", count_parameters_in_MB(model))
@@ -124,7 +133,7 @@ def main():
 	del optimizer_w
 	del scheduler
 
-	criterion = nn.CrossEntropyLoss()
+	criterion = MixSoftmaxCrossEntropyLoss()
 	criterion = criterion.cuda()
 
 	input_transform = transforms.Compose([
@@ -133,13 +142,13 @@ def main():
         ])
 	data_kwargs = {'transform': input_transform, 'base_size': 1024, 'crop_size': (512, 1024)}
 	train_dataset = get_segmentation_dataset(split='train', mode='train', **data_kwargs)
-	val_dataset = get_segmentation_dataset(split='val', mode='testval', **data_kwargs)
+	val_dataset = get_segmentation_dataset(split='val', mode='val', **data_kwargs)
 
 	iters_per_epoch = len(train_dataset) // (args.num_gpus * args.batch_size)
 	max_iters = args.epochs * iters_per_epoch
 
 	train_sampler = make_data_sampler(train_dataset, shuffle=True, distributed=args.distributed)
-	train_batch_sampler = make_batch_data_sampler(train_sampler, args.batch_size, max_iters, drop_last=True)
+	train_batch_sampler = make_batch_data_sampler(train_sampler, args.batch_size, iters_per_epoch, drop_last=True)
 	val_sampler = make_data_sampler(val_dataset, shuffle=False, distributed=args.distributed)
 	val_batch_sampler = make_batch_data_sampler(val_sampler, args.batch_size, drop_last=False)
 	
@@ -162,6 +171,7 @@ def main():
 		state_dict = torch.load(model_path)['state_dict']
 		for key in state_dict:
 			if 'm_ops' not in key:
+				# print('model.{}.data'.format(key))
 				exec('model.{}.data = state_dict[key].data'.format(key))
 		for stage in mc_mask_dddict:
 			for block in mc_mask_dddict[stage]:
@@ -223,14 +233,15 @@ def main():
 			logging.info(' '.join(['{:.6f}'.format(p) for p in param]))
 		logging.info('Train_acc %f', train_acc)
 		epoch_duration = time.time() - epoch_start
-		logging.info('Epoch time: %ds', epoch_duration)
+		eta_string = str(datetime.timedelta(seconds=int(epoch_duration*(args.epochs-epoch))))
+		logging.info('Epoch time: %ds, Estimated Time: %s', epoch_duration, eta_string)
 		writer.add_scalar('Train/train_acc', train_acc, epoch)
 
 		# validation for last 5 epochs
-		if args.epochs - epoch < 10:
-			val_acc = validate(val_queue, model, criterion)
+		if args.epochs - epoch < 10 or epoch > 20:
+			val_acc = validate(val_queue, model, criterion, epoch, args)
 			logging.info('Val_acc %f', val_acc)
-			writer.add_scalar('Train/val_acc', val_acc, 5 - (args.epochs - epoch))
+			writer.add_scalar('Train/val_acc', val_acc, epoch)
 
 		# update state_dict
 		state_dict_from_model = model.state_dict()
@@ -318,8 +329,6 @@ def main():
 
 def train_wo_arch(train_queue, model, criterion, optimizer_w):
 	objs_w = AverageMeter()
-	top1   = AverageMeter()
-	top5   = AverageMeter()
 
 	model.train()
 
@@ -328,12 +337,21 @@ def train_wo_arch(train_queue, model, criterion, optimizer_w):
 	for param in model.module.arch_parameters():
 		param.requires_grad = False
 
+	steps = len(train_queue)
+
 	for step, (x_w, target_w, _) in enumerate(train_queue):
+		# print(x_w)
+		
 		x_w = x_w.cuda(non_blocking=True)
 		target_w = target_w.cuda(non_blocking=True)
 
 		logits_w_gumbel, _ = model(x_w, sampling=True, mode='gumbel')
-		loss_w_gumbel = criterion(logits_w_gumbel, target_w)
+		loss_w_gumbel_dist = criterion(logits_w_gumbel, target_w)
+		loss_w_gumbel = sum(loss for loss in loss_w_gumbel_dist.values())
+
+		# loss_dict_reduced = reduce_loss_dict(loss_w_gumbel_dist)
+        # losses_reduced = sum(loss for loss in loss_dict_reduced.values()
+
 		# reset switches of log_alphas
 		model.module.reset_switches()
 
@@ -343,28 +361,24 @@ def train_wo_arch(train_queue, model, criterion, optimizer_w):
 			nn.utils.clip_grad_norm_(model.module.weight_parameters(), args.grad_clip)
 		optimizer_w.step()
 
-		prec1, prec5 = accuracy(logits_w_gumbel, target_w, topk=(1, 5))
 		n = x_w.size(0)
 		objs_w.update(loss_w_gumbel.item(), n)
-		top1.update(prec1.item(), n)
-		top5.update(prec5.item(), n)
 
 		if step % args.print_freq == 0:
-			logging.info('TRAIN wo_Arch Step: %04d Objs: %f R1: %f R5: %f', step, objs_w.avg, top1.avg, top5.avg)
+			logging.info('TRAIN wo_Arch Step: %04d/%d Objs: %f', step, steps, objs_w.avg)
 
-	return top1.avg
+	return objs_w.avg
 
 
 def train_w_arch(train_queue, val_queue, model, criterion, optimizer_w, optimizer_a):
 	objs_a = AverageMeter()
 	objs_l = AverageMeter()
 	objs_w = AverageMeter()
-	top1   = AverageMeter()
-	top5   = AverageMeter()
 
 	model.train()
+	steps = len(train_queue)
 
-	for step, (x_w, target_w) in enumerate(train_queue):
+	for step, (x_w, target_w, _) in enumerate(train_queue):
 		x_w = x_w.cuda(non_blocking=True)
 		target_w = target_w.cuda(non_blocking=True)
 
@@ -374,9 +388,11 @@ def train_w_arch(train_queue, val_queue, model, criterion, optimizer_w, optimize
 			param.requires_grad = False
 		
 		logits_w_gumbel, _ = model(x_w, sampling=True, mode='gumbel')
-		loss_w_gumbel = criterion(logits_w_gumbel, target_w)
+		loss_w_gumbel_dist = criterion(logits_w_gumbel, target_w)
+		loss_w_gumbel = sum(loss for loss in loss_w_gumbel_dist.values())
 		logits_w_random, _ = model(x_w, sampling=True, mode='random')
-		loss_w_random = criterion(logits_w_random, target_w)
+		loss_w_random_dist = criterion(logits_w_random, target_w)
+		loss_w_random = sum(loss for loss in loss_w_random_dist.values())
 		loss_w = loss_w_gumbel + loss_w_random
 
 		optimizer_w.zero_grad()
@@ -385,11 +401,8 @@ def train_w_arch(train_queue, val_queue, model, criterion, optimizer_w, optimize
 			nn.utils.clip_grad_norm_(model.module.weight_parameters(), args.grad_clip)
 		optimizer_w.step()
 
-		prec1, prec5 = accuracy(logits_w_gumbel, target_w, topk=(1, 5))
 		n = x_w.size(0)
 		objs_w.update(loss_w.item(), n)
-		top1.update(prec1.item(), n)
-		top5.update(prec5.item(), n)
 
 		if step % 2 == 0:
 			# optimize a
@@ -397,7 +410,7 @@ def train_w_arch(train_queue, val_queue, model, criterion, optimizer_w, optimize
 				x_a, target_a = next(val_queue_iter)
 			except:
 				val_queue_iter = iter(val_queue)
-				x_a, target_a = next(val_queue_iter)
+				x_a, target_a, _= next(val_queue_iter)
 
 			x_a = x_a.cuda(non_blocking=True)
 			target_a = target_a.cuda(non_blocking=True)
@@ -407,8 +420,10 @@ def train_w_arch(train_queue, val_queue, model, criterion, optimizer_w, optimize
 			for param in model.module.arch_parameters():
 				param.requires_grad = True
 
-			logits_a, lat = model(x_a, sampling=False)
-			loss_a = criterion(logits_a, target_a)
+			logits_a, lat_dist = model(x_a, sampling=False)
+			loss_a_dist = criterion(logits_a, target_a)
+			loss_a = sum(loss for loss in loss_a_dist.values())
+			lat = sum(loss for loss in lat_dist) # ???? why
 			loss_l = torch.abs(lat / args.target_lat - 1.) * args.lambda_lat
 			loss = loss_a + loss_l
 
@@ -427,40 +442,46 @@ def train_w_arch(train_queue, val_queue, model, criterion, optimizer_w, optimize
 			objs_l.update(loss_l.item(), n)
 
 		if step % args.print_freq == 0:
-			logging.info('TRAIN w_Arch Step: %04d Objs_W: %f R1: %f R5: %f Objs_A: %f Objs_L: %f', 
-						  step, objs_w.avg, top1.avg, top5.avg, objs_a.avg, objs_l.avg)
+			logging.info('TRAIN w_Arch Step: %04d/%d Objs_W: %f Objs_A: %f Objs_L: %f', 
+						  step, steps, objs_w.avg, objs_a.avg, objs_l.avg)
 
-	return top1.avg
+	return objs_w.avg
 
 
-def validate(val_queue, model, criterion):
+def validate(val_queue, model, criterion, epoch, args):
 	objs = AverageMeter()
-	top1 = AverageMeter()
-	top5 = AverageMeter()
 
 	# model.eval()
 	# disable moving average
+	metric = SegmentationMetric(args.num_classes, args.distributed)
+	metric.reset()
+
+	torch.cuda.empty_cache()
 	model.train()
 
-	for step, (x, target) in enumerate(val_queue):
+	steps = len(val_queue)
+
+	for step, (x, target, _) in enumerate(val_queue):
 		x = x.cuda(non_blocking=True)
 		target = target.cuda(non_blocking=True)
 		with torch.no_grad():
 			logits, _ = model(x, sampling=True, mode='gumbel')
-			loss = criterion(logits, target)
+			loss_dist = criterion(logits, target)
+			loss = sum(los for los in loss_dist.values())
 		# reset switches of log_alphas
 		model.module.reset_switches()
 
-		prec1, prec5 = accuracy(logits, target, topk=(1, 5))
 		n = x.size(0)
 		objs.update(loss.item(), n)
-		top1.update(prec1.item(), n)
-		top5.update(prec5.item(), n)
+		metric.update(logits, target)
+		pixAcc, mIoU = metric.get()
 
 		if step % args.print_freq == 0:
-			logging.info('VALIDATE Step: %04d Objs: %f R1: %f R5: %f', step, objs.avg, top1.avg, top5.avg)
+			logging.info('VALIDATE Step: {:d}/{:d}, Objs: {:f} pixAcc: {:.3f}, mIoU: {:.3f}'.format(step, steps, objs.avg, pixAcc * 100, mIoU * 100))
 
-	return top1.avg
+	pixAcc, mIoU = metric.get()
+	logging.info("[EVAL END] Epoch: {:d}, pixAcc: {:.3f}, mIoU: {:.3f}".format(epoch, pixAcc * 100, mIoU * 100))
+	return mIoU * 100
 
 
 def get_lookup_latency(parsed_arch, mc_num_dddict, lat_lookup_key_dddict, lat_lookup):

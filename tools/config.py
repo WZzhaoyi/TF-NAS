@@ -200,20 +200,20 @@ mc_mask_dddict = OrderedDict([
 lat_lookup_key_dddict = OrderedDict([
 		('stage1', OrderedDict([
 				('block1', OrderedDict([
-						(0, 'MBInvertedResBlock_128_64_0_128_k3_s2_relu'),
-						(1, 'MBInvertedResBlock_128_64_0_128_k3_s2_relu'),
-						(2, 'MBInvertedResBlock_128_64_0_128_k5_s2_relu'),
-						(3, 'MBInvertedResBlock_128_64_0_128_k5_s2_relu'),
+						(0, 'MBInvertedResBlock_128_64_0_80_k3_s2_relu'),
+						(1, 'MBInvertedResBlock_128_64_0_80_k3_s2_relu'),
+						(2, 'MBInvertedResBlock_128_64_0_80_k5_s2_relu'),
+						(3, 'MBInvertedResBlock_128_64_0_80_k5_s2_relu'),
 						(4, 'MBInvertedResBlock_128_64_64_80_k3_s2_relu'),
 						(5, 'MBInvertedResBlock_128_64_128_80_k3_s2_relu'),
 						(6, 'MBInvertedResBlock_128_64_64_80_k5_s2_relu'),
 						(7, 'MBInvertedResBlock_128_64_128_80_k5_s2_relu'),
 					])),
 				('block2', OrderedDict([
-						(0, 'MBInvertedResBlock_64_80_0_128_k3_s1_relu'),
-						(1, 'MBInvertedResBlock_64_80_0_128_k3_s1_relu'),
-						(2, 'MBInvertedResBlock_64_80_0_128_k5_s1_relu'),
-						(3, 'MBInvertedResBlock_64_80_0_128_k5_s1_relu'),
+						(0, 'MBInvertedResBlock_64_80_0_80_k3_s1_relu'),
+						(1, 'MBInvertedResBlock_64_80_0_80_k3_s1_relu'),
+						(2, 'MBInvertedResBlock_64_80_0_80_k5_s1_relu'),
+						(3, 'MBInvertedResBlock_64_80_0_80_k5_s1_relu'),
 						(4, 'MBInvertedResBlock_64_80_80_80_k3_s1_relu'),
 						(5, 'MBInvertedResBlock_64_80_160_80_k3_s1_relu'),
 						(6, 'MBInvertedResBlock_64_80_80_80_k5_s1_relu'),
