@@ -149,8 +149,8 @@ def main():
 
 	train_sampler = make_data_sampler(train_dataset, shuffle=True, distributed=args.distributed)
 	train_batch_sampler = make_batch_data_sampler(train_sampler, args.batch_size, iters_per_epoch, drop_last=True)
-	val_sampler = make_data_sampler(val_dataset, shuffle=False, distributed=args.distributed)
-	val_batch_sampler = make_batch_data_sampler(val_sampler, args.batch_size, drop_last=False)
+	val_sampler = make_data_sampler(val_dataset, shuffle=True, distributed=args.distributed)
+	val_batch_sampler = make_batch_data_sampler(val_sampler, args.batch_size, drop_last=True)
 	
 	train_queue = torch.utils.data.DataLoader(
 		dataset=train_dataset,
@@ -219,9 +219,13 @@ def main():
 		epoch_start = time.time()
 		if epoch < 10:
 			train_acc = train_wo_arch(train_queue, model, criterion, optimizer_w)
+			writer.add_scalar('Train/objs_w', train_acc, epoch)
 		else:
 			train_acc = train_w_arch(train_queue, val_queue, model, criterion, optimizer_w, optimizer_a)
 			args.T *= args.T_decay
+			writer.add_scalar('Train/objs_w', train_acc[0], epoch)
+			writer.add_scalar('Train/objs_a', train_acc[1], epoch)
+			train_acc = train_acc[0]
 		# logging arch parameters
 		logging.info('The current arch parameters are:')
 		for param in model.module.log_alphas_parameters():
@@ -235,13 +239,14 @@ def main():
 		epoch_duration = time.time() - epoch_start
 		eta_string = str(datetime.timedelta(seconds=int(epoch_duration*(args.epochs-epoch))))
 		logging.info('Epoch time: %ds, Estimated Time: %s', epoch_duration, eta_string)
-		writer.add_scalar('Train/train_acc', train_acc, epoch)
+		
 
 		# validation for last 5 epochs
-		if args.epochs - epoch < 10 or epoch > 20:
+		if args.epochs - epoch < 10 or epoch >= 10:
 			val_acc = validate(val_queue, model, criterion, epoch, args)
-			logging.info('Val_acc %f', val_acc)
-			writer.add_scalar('Train/val_acc', val_acc, epoch)
+			logging.info('Val_acc pixAcc: %f mIoU: %f', val_acc[0], val_acc[1])
+			writer.add_scalar('Val/pixAcc', val_acc[0], epoch)
+			writer.add_scalar('Val/mIoU', val_acc[1], epoch)
 
 		# update state_dict
 		state_dict_from_model = model.state_dict()
@@ -445,7 +450,7 @@ def train_w_arch(train_queue, val_queue, model, criterion, optimizer_w, optimize
 			logging.info('TRAIN w_Arch Step: %04d/%d Objs_W: %f Objs_A: %f Objs_L: %f', 
 						  step, steps, objs_w.avg, objs_a.avg, objs_l.avg)
 
-	return objs_w.avg
+	return [objs_w.avg, objs_a.avg]
 
 
 def validate(val_queue, model, criterion, epoch, args):
@@ -481,7 +486,7 @@ def validate(val_queue, model, criterion, epoch, args):
 
 	pixAcc, mIoU = metric.get()
 	logging.info("[EVAL END] Epoch: {:d}, pixAcc: {:.3f}, mIoU: {:.3f}".format(epoch, pixAcc * 100, mIoU * 100))
-	return mIoU * 100
+	return [pixAcc * 100, mIoU * 100]
 
 
 def get_lookup_latency(parsed_arch, mc_num_dddict, lat_lookup_key_dddict, lat_lookup):

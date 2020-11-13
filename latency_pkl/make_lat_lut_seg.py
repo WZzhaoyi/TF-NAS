@@ -11,6 +11,7 @@ sys.path.append('..')
 
 from tools.utils import measure_latency_in_ms
 from models.layers import *
+from models.seg_model_search import *
 
 cudnn.enabled = True
 cudnn.benchmark = True
@@ -45,28 +46,20 @@ def get_latency_lookup(is_cuda):
 	latency_lookup = OrderedDict()
 
 	# first 3x3 conv, 3x3 sep conv, last 1x1 conv, avgpool, fc
-	print('first 3x3 conv, 3x3 sep conv, last 1x1 conv, avgpool, fc')
-	block = ConvLayer(3, 32, kernel_size=3, stride=2, affine=True, act_func='relu')
-	shape = (32, 3, 224, 224) if is_cuda else (1, 3, 224, 224)
+	print('LearningToDownsample, FeatureFusionModule, Classifer')
+	block = LearningToDownsample(32, 48, 64)
+	shape = (8, 3, 512, 1024) if is_cuda else (1, 3, 512, 1024)
 	lat1  = measure_latency_in_ms(block, shape, is_cuda)
 	# time.sleep(0.1)
-	block = MBInvertedResBlock(32, 32, 8, 16, kernel_size=3, stride=1, affine=True, act_func='relu')
-	shape = (32, 32, 112, 112) if is_cuda else (1, 32, 112, 112)
+	block = FeatureFusionModule(64, 320, 320)
+	shape = [(8, 64, 64, 128),(8, 320, 16, 32)] if is_cuda else [(8, 64, 64, 128),(8, 320, 16, 32)]
 	lat2  = measure_latency_in_ms(block, shape, is_cuda)
 	# time.sleep(0.1)
-	block = ConvLayer(320, 1280, kernel_size=1, stride=1, affine=True, act_func='swish')
-	shape = (32, 320, 7, 7) if is_cuda else (1, 320, 7, 7)
+	block = Classifer(320, 19)
+	shape = (8, 320, 16, 32) if is_cuda else (1, 320, 16, 32)
 	lat3  = measure_latency_in_ms(block, shape, is_cuda)
 	# time.sleep(0.1)
-	block = nn.AdaptiveAvgPool2d(1)
-	shape = (32, 1280, 7, 7) if is_cuda else (1, 1280, 7, 7)
-	lat4  = measure_latency_in_ms(block, shape, is_cuda)
-	# time.sleep(0.1)
-	block = LinearLayer(1280, 1000)
-	shape = (32, 1280) if is_cuda else (1, 1280)
-	lat5  = measure_latency_in_ms(block, shape, is_cuda)
-	# time.sleep(0.1)
-	latency_lookup['base'] = lat1 + lat2 + lat3 + lat4 + lat5 # + 0.1  # 0.1 is the latency rectifier
+	latency_lookup['base'] = lat1 + lat2 + lat3 # + 0.1  # 0.1 is the latency rectifier
 
 
 	# 64x128 cin=64 cout=80 s=2 relu
@@ -524,11 +517,11 @@ if __name__ == '__main__':
 	print('measure latency on gpu......')
 	latency_lookup = get_latency_lookup(is_cuda=True)
 	# latency_lookup = convert_latency_lookup(latency_lookup)
-	with open('latency_gpu_example.pkl', 'wb') as f:
+	with open('latency_gpu_seg.pkl', 'wb') as f:
 		pickle.dump(latency_lookup, f)
 
 	print('measure latency on cpu......')
 	latency_lookup = get_latency_lookup(is_cuda=False)
 	# latency_lookup = convert_latency_lookup(latency_lookup)
-	with open('latency_cpu_example.pkl', 'wb') as f:
+	with open('latency_cpu_seg.pkl', 'wb') as f:
 		pickle.dump(latency_lookup, f)

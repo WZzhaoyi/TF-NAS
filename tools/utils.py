@@ -7,30 +7,47 @@ import shutil
 import time
 from torch import distributed as dist
 
-INIT_TIMES = 100
-LAT_TIMES  = 1000
+
 
 def measure_latency_in_ms(model, input_shape, is_cuda):
+	INIT_TIMES = 10
+	LAT_TIMES  = 100
 	lat = AverageMeter()
 	model.eval()
-
-	x = torch.randn(input_shape)
+	if(isinstance(input_shape,list)):
+		x = [torch.randn(item) for item in input_shape]
+	else:
+		x = torch.randn(input_shape)
 	if is_cuda:
 		model = model.cuda()
-		x = x.cuda()
+		if(isinstance(input_shape,list)):
+			x = [item.cuda() for item in x]
+			batch_size = x[0].size(0)
+		else:
+			x = x.cuda()
+			batch_size =x.size(0)
 	else:
 		model = model.cpu()
-		x = x.cpu()
-
+		if(isinstance(input_shape,list)):
+			x = [item.cpu() for item in x]
+		else:
+			x = x.cpu()
+		batch_size = 1
 	with torch.no_grad():
 		for _ in range(INIT_TIMES):
-			output = model(x)
+			if(isinstance(x,list) and len(x) == 2):
+				output = model(x[0],x[1])
+			else:
+				output = model(x)
 
 		for _ in range(LAT_TIMES):
 			tic = time.time()
-			output = model(x)
+			if(isinstance(x,list) and len(x) == 2):
+				output = model(x[0],x[1])
+			else:
+				output = model(x)
 			toc = time.time()
-			lat.update(toc-tic, x.size(0))
+			lat.update(toc-tic, batch_size)
 
 	return lat.avg * 1000 # save as ms
 

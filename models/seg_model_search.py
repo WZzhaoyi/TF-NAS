@@ -274,6 +274,8 @@ class Network(nn.Module):
 							mc_num_ddict = mc_num_dddict['stage6'],
 							lat_lookup = lat_lookup,
 							stage_type = 0,)
+		self.ppm = PyramidPooling(320)
+		self.out = _ConvBNReLU(320 * 2, 320, 1)
 		self.feature_mix_layer = FeatureFusionModule(64, 320, 320)
 		self.classifier = Classifer(320, self.nclass)
 
@@ -297,6 +299,8 @@ class Network(nn.Module):
 		out_lat += lat
 		x, lat = self.stage6(x, sampling, mode)
 		out_lat += lat
+		x = self.ppm(x)
+		x = self.out(x)
 
 		x = self.feature_mix_layer(higher_res_features, x)
 		x = self.classifier(x)
@@ -394,6 +398,24 @@ class _ConvBNReLU(nn.Module):
         x = self.bn(x)
         x = self.relu(x)
         return x
+
+
+class PyramidPooling(nn.Module):
+    def __init__(self, in_channels, sizes=(1, 2, 3, 6), norm_layer=nn.BatchNorm2d, **kwargs):
+        super(PyramidPooling, self).__init__()
+        out_channels = int(in_channels / 4)
+        self.avgpools = nn.ModuleList()
+        self.convs = nn.ModuleList()
+        for size in sizes:
+            self.avgpools.add_module('stage' + str(size), nn.AdaptiveAvgPool2d(size))
+            self.convs.add_module('stage' + str(size), _ConvBNReLU(in_channels, out_channels, 1, norm_layer=norm_layer, **kwargs))
+
+    def forward(self, x):
+        size = x.size()[2:]
+        feats = [x]
+        for (avgpool, conv) in zip(self.avgpools, self.convs):
+            feats.append(F.interpolate(conv(avgpool(x)), size, mode='bilinear', align_corners=True))
+        return torch.cat(feats, dim=1)
 
 
 class SeparableConv2d(nn.Module):
