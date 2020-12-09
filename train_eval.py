@@ -7,6 +7,7 @@ import argparse
 import json
 import numpy as np
 import warnings
+import datetime
 warnings.filterwarnings('ignore')
 
 import torch
@@ -14,24 +15,26 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.backends.cudnn as cudnn
 import torchvision.transforms as transforms
+from tensorboardX import SummaryWriter
 
-from tools.utils import AverageMeter, accuracy
+from tools.utils import AverageMeter, accuracy, SegmentationMetric
 from tools.utils import count_parameters_in_MB
 from tools.utils import create_exp_dir, save_checkpoint
-from models.model_eval import Network, NetworkCfg
+from models.seg_model_eval import Network, NetworkCfg
 from parsing_model import get_op_and_depth_weights
 from parsing_model import parse_architecture
 from parsing_model import get_mc_num_dddict
-from dataset import ImageList, pil_loader, cv2_loader
+from dataset import get_segmentation_dataset
 from dataset import IMAGENET_MEAN, IMAGENET_STD
+from loss import MixSoftmaxCrossEntropyLoss
 
 
 parser = argparse.ArgumentParser("training the searched architecture on imagenet")
 # various path
-parser.add_argument('--train_root', type=str, required=True, help='training image root path')
-parser.add_argument('--val_root', type=str, required=True, help='validating image root path')
-parser.add_argument('--train_list', type=str, required=True, help='training image list')
-parser.add_argument('--val_list', type=str, required=True, help='validating image list')
+parser.add_argument('--train_root', type=str, help='training image root path')
+parser.add_argument('--val_root', type=str, help='validating image root path')
+parser.add_argument('--train_list', type=str, help='training image list')
+parser.add_argument('--val_list', type=str, help='validating image list')
 parser.add_argument('--model_path', type=str, default='', help='the searched model path')
 parser.add_argument('--config_path', type=str, default='', help='the model config path')
 parser.add_argument('--save', type=str, default='./checkpoints/', help='model and log saving path')
@@ -50,13 +53,15 @@ parser.add_argument('--label_smooth', type=float, default=0.1, help='label smoot
 parser.add_argument('--num_classes', type=int, default=1000, help='class number of training set')
 parser.add_argument('--dropout_rate', type=float, default=0.2, help='dropout rate')
 parser.add_argument('--drop_connect_rate', type=float, default=0.2, help='dropout connect rate')
+parser.add_argument('--distributed', type=int, default=0, help='distributed')
+parser.add_argument('--num_gpus', type=int, default=1, help='number of gpus')
 
 # others
 parser.add_argument('--seed', type=int, default=2, help='random seed')
 parser.add_argument('--note', type=str, default='try', help='note for this run')
 
 
-args, unparsed = parser.parse_known_args()
+args = parser.parse_args()
 
 args.save = os.path.join(args.save, 'eval-{}-{}'.format(time.strftime("%Y%m%d-%H%M%S"), args.note))
 create_exp_dir(args.save, scripts_to_save=None)
@@ -67,6 +72,7 @@ logging.basicConfig(stream=sys.stdout, level=logging.INFO,
 fh = logging.FileHandler(os.path.join(args.save, 'log.txt'))
 fh.setFormatter(logging.Formatter(log_format))
 logging.getLogger().addHandler(fh)
+writer = SummaryWriter(logdir=os.path.join(args.save, 'log'))
 
 
 class CrossEntropyLabelSmooth(nn.Module):
@@ -97,8 +103,8 @@ def main():
 	set_seed(args.seed)
 	cudnn.enabled=True
 	cudnn.benchmark = True
+	# torch.backends.cudnn.enabled = False
 	logging.info("args = %s", args)
-	logging.info("unparsed_args = %s", unparsed)
 
 	# create model
 	logging.info('parsing the architecture')
@@ -114,55 +120,42 @@ def main():
 	else:
 		raise Exception('invalid --model_path and --config_path')
 	model = nn.DataParallel(model).cuda()
-	config = model.module.config
-	with open(os.path.join(args.save, 'model.config'), 'w') as f:
-		json.dump(config, f, indent=4)
+	# config = model.module.config
+	# with open(os.path.join(args.save, 'model.config'), 'w') as f:
+	# 	json.dump(config, f, indent=4)
 	# logging.info(config)
 	logging.info("param size = %fMB", count_parameters_in_MB(model))
 
 	# define loss function (criterion) and optimizer
-	criterion = nn.CrossEntropyLoss()
+	criterion = MixSoftmaxCrossEntropyLoss(aux=False)
 	criterion = criterion.cuda()
-	criterion_smooth = CrossEntropyLabelSmooth(args.num_classes, args.label_smooth)
-	criterion_smooth = criterion_smooth.cuda()
+	# criterion_smooth = CrossEntropyLabelSmooth(args.num_classes, args.label_smooth)
+	# criterion_smooth = criterion_smooth.cuda()
 
 	optimizer = torch.optim.SGD(model.parameters(), args.lr,
 								momentum=args.momentum,
 								weight_decay=args.weight_decay)
 
 	# define transform and initialize dataloader
-	train_transform = transforms.Compose([
-							transforms.RandomResizedCrop(224),
-							transforms.RandomHorizontalFlip(),
-							transforms.ColorJitter(
-								brightness=0.4,
-								contrast=0.4,
-								saturation=0.4,#),
-								hue=0.2),
-							transforms.ToTensor(),
-							transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
-						])
-	val_transform   = transforms.Compose([
-							transforms.Resize(256),
-							transforms.CenterCrop(224),
-							transforms.ToTensor(),
-							transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
-						])
+	input_transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ])
+	data_kwargs = {'transform': input_transform, 'base_size': 1024, 'crop_size': (512, 1024)}
+	train_dataset = get_segmentation_dataset(split='train', mode='train', **data_kwargs)
+	val_dataset = get_segmentation_dataset(split='val', mode='val', **data_kwargs)
 	train_queue = torch.utils.data.DataLoader(
-		ImageList(root=args.train_root, 
-				  list_path=args.train_list, 
-				  transform=train_transform,), 
-		batch_size=args.batch_size, shuffle=True, pin_memory=True, num_workers=args.workers)
-	val_queue   = torch.utils.data.DataLoader(
-		ImageList(root=args.val_root, 
-				  list_path=args.val_list, 
-				  transform=val_transform,), 
-		batch_size=args.batch_size, shuffle=False, pin_memory=True, num_workers=args.workers)
+		dataset=train_dataset,
+		batch_size=args.batch_size, shuffle=True, pin_memory=True, num_workers=args.workers, drop_last=True)
+
+	val_queue = torch.utils.data.DataLoader(
+		dataset=val_dataset,
+		batch_size=args.batch_size, shuffle=True, pin_memory=True, num_workers=args.workers, drop_last=True)
 
 	# define learning rate scheduler
 	scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, float(args.epochs))
-	best_acc_top1 = 0
-	best_acc_top5 = 0
+	best_acc_picAcc = 0
+	best_acc_mIoU = 0
 	start_epoch = 0
 
 	# restart from snapshot
@@ -170,8 +163,8 @@ def main():
 		logging.info('loading snapshot from {}'.format(args.snapshot))
 		checkpoint = torch.load(args.snapshot)
 		start_epoch = checkpoint['epoch']
-		best_acc_top1 = checkpoint['best_acc_top1']
-		best_acc_top5 = checkpoint['best_acc_top5']
+		best_acc_picAcc = checkpoint['best_acc_picAcc']
+		best_acc_mIoU = checkpoint['best_acc_mIoU']
 		model.load_state_dict(checkpoint['state_dict'])
 		optimizer.load_state_dict(checkpoint['optimizer'])
 		scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, float(args.epochs), last_epoch=0)
@@ -197,24 +190,29 @@ def main():
 			logging.info('Warming-up Epoch: %d, LR: %e', epoch, current_lr * (epoch + 1) / 5.0)
 
 		epoch_start = time.time()
-		train_acc, train_obj = train(train_queue, model, criterion_smooth, optimizer)
+		train_acc = train(train_queue, model, criterion, optimizer)
 		logging.info('Train_acc: %f', train_acc)
+		writer.add_scalar('Train/objs_w', train_acc, epoch)
 
-		val_acc_top1, val_acc_top5, val_obj = validate(val_queue, model, criterion)
-		logging.info('Val_acc_top1: %f', val_acc_top1)
-		logging.info('Val_acc_top5: %f', val_acc_top5)
-		logging.info('Epoch time: %ds.', time.time() - epoch_start)
+		val_acc_picAcc, val_acc_mIoU, val_obj = validate(val_queue, model, criterion)
+		logging.info('Val_acc_picAcc: %f', val_acc_picAcc)
+		logging.info('Val_acc_mIoU: %f', val_acc_mIoU)
+		writer.add_scalar('Val/pixAcc', val_acc_picAcc, epoch)
+		writer.add_scalar('Val/mIoU', val_acc_mIoU, epoch)
+		epoch_duration = time.time() - epoch_start
+		eta_string = str(datetime.timedelta(seconds=int(epoch_duration*(args.epochs-epoch))))
+		logging.info('Epoch time: %ds. Estimated time: %s', epoch_duration, eta_string)
 
 		is_best = False
-		if val_acc_top1 > best_acc_top1:
-			best_acc_top1 = val_acc_top1
-			best_acc_top5 = val_acc_top5
+		if val_acc_mIoU > best_acc_mIoU:
+			best_acc_picAcc = val_acc_picAcc
+			best_acc_mIoU = val_acc_mIoU
 			is_best = True
 		save_checkpoint({
 			'epoch': epoch + 1,
 			'state_dict': model.state_dict(),
-			'best_acc_top1': best_acc_top1,
-			'best_acc_top5': best_acc_top5,
+			'best_acc_picAcc': best_acc_picAcc,
+			'best_acc_mIoU': best_acc_mIoU,
 			'optimizer' : optimizer.state_dict(),
 			}, is_best, args.save)
 
@@ -227,12 +225,11 @@ def main():
 
 def train(train_queue, model, criterion, optimizer):
 	objs = AverageMeter()
-	top1 = AverageMeter()
-	top5 = AverageMeter()
 	batch_time = AverageMeter()
 	data_time  = AverageMeter()
 	model.train()
 
+	steps = len(train_queue)
 	end = time.time()
 	for step, data in enumerate(train_queue):
 		data_time.update(time.time() - end)
@@ -242,7 +239,8 @@ def train(train_queue, model, criterion, optimizer):
 		# forward
 		batch_start = time.time()
 		logits = model(x)
-		loss = criterion(logits, target)
+		loss_dict = criterion(logits, target)
+		loss = sum(loss for loss in loss_dict.values())
 
 		# backward
 		optimizer.zero_grad()
@@ -252,48 +250,46 @@ def train(train_queue, model, criterion, optimizer):
 		optimizer.step()
 		batch_time.update(time.time() - batch_start)
 
-		prec1, prec5 = accuracy(logits, target, topk=(1, 5))
 		n = x.size(0)
 		objs.update(loss.data.item(), n)
-		top1.update(prec1.data.item(), n)
-		top5.update(prec5.data.item(), n)
 
 		if step % args.print_freq == 0:
 			duration = 0 if step == 0 else time.time() - duration_start
 			duration_start = time.time()
-			logging.info('TRAIN Step: %03d Objs: %e R1: %f R5: %f Duration: %ds BTime: %.3fs DTime: %.4fs', 
-									step, objs.avg, top1.avg, top5.avg, duration, batch_time.avg, data_time.avg)
+			logging.info('TRAIN Step: %03d/%d Objs: %e Duration: %ds BTime: %.3fs DTime: %.4fs', 
+									step, steps, objs.avg, duration, batch_time.avg, data_time.avg)
 		end = time.time()
 
-	return top1.avg, objs.avg
+	return objs.avg
 
 
 def validate(val_queue, model, criterion):
 	objs = AverageMeter()
-	top1 = AverageMeter()
-	top5 = AverageMeter()
 	model.eval()
+	metric = SegmentationMetric(args.num_classes, args.distributed)
+	metric.reset()
 
+	steps = len(val_queue)
 	for step, data in enumerate(val_queue):
 		x = data[0].cuda(non_blocking=True)
 		target = data[1].cuda(non_blocking=True)
 
 		with torch.no_grad():
 			logits = model(x)
-			loss = criterion(logits, target)
+			loss_dict = criterion(logits, target)
+			loss = sum(loss for loss in loss_dict.values())
 
-		prec1, prec5 = accuracy(logits, target, topk=(1, 5))
 		n = x.size(0)
 		objs.update(loss.data.item(), n)
-		top1.update(prec1.data.item(), n)
-		top5.update(prec5.data.item(), n)
+		metric.update(logits, target)
+		pixAcc, mIoU = metric.get()
 
 		if step % args.print_freq == 0:
 			duration = 0 if step == 0 else time.time() - duration_start
 			duration_start = time.time()
-			logging.info('VALID Step: %03d Objs: %e R1: %f R5: %f Duration: %ds', step, objs.avg, top1.avg, top5.avg, duration)
-
-	return top1.avg, top5.avg, objs.avg
+			logging.info('VALID Step: %03d/%d Objs: %e pixAcc: %f mIoU: %f Duration: %ds', step, steps, objs.avg, pixAcc * 100, mIoU * 100, duration)
+	pixAcc, mIoU = metric.get()
+	return pixAcc * 100, mIoU * 100, objs.avg
 
 
 if __name__ == '__main__':

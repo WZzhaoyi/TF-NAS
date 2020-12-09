@@ -1,0 +1,18 @@
+CUDA_VISIBLE_DEVICES=0 python -u train_eval.py \
+	--model_path "./runs/search-20201116-122146-TF-NAS-fastSCNN-gpus/searched_model_263.pth.tar" \
+    --save "./checkpoints" \
+    --print_freq 40 \
+    --workers 4 \
+    --epochs 1000 \
+    --batch_size 16 \
+    --lr 0.045 \
+    --momentum 0.9 \
+    --weight_decay 1e-5 \
+    --grad_clip 20.0 \
+    --label_smooth 0.1 \
+    --num_gpus 1 \
+    --num_classes 19 \
+    --dropout_rate 0.2 \
+    --drop_connect_rate 0.2 \
+    --distributed 0 \
+    --note eval-fastSCNN-gpus

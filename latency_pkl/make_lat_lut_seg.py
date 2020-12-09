@@ -12,6 +12,7 @@ sys.path.append('..')
 from tools.utils import measure_latency_in_ms
 from models.layers import *
 from models.seg_model_search import *
+from models.seg_model_search import _ConvBNReLU
 
 cudnn.enabled = True
 cudnn.benchmark = True
@@ -45,25 +46,31 @@ OPS = {
 def get_latency_lookup(is_cuda):
 	latency_lookup = OrderedDict()
 
-	# first 3x3 conv, 3x3 sep conv, last 1x1 conv, avgpool, fc
 	print('LearningToDownsample, FeatureFusionModule, Classifer')
 	block = LearningToDownsample(32, 48, 64)
 	shape = (8, 3, 512, 1024) if is_cuda else (1, 3, 512, 1024)
 	lat1  = measure_latency_in_ms(block, shape, is_cuda)
 	# time.sleep(0.1)
-	block = FeatureFusionModule(64, 320, 320)
-	shape = [(8, 64, 64, 128),(8, 320, 16, 32)] if is_cuda else [(8, 64, 64, 128),(8, 320, 16, 32)]
+	block = FeatureFusionModule(64, 144, 144)
+	shape = [(8, 64, 64, 128),(8, 144, 16, 32)] if is_cuda else [(1, 64, 64, 128),(1, 144, 16, 32)]
 	lat2  = measure_latency_in_ms(block, shape, is_cuda)
 	# time.sleep(0.1)
-	block = Classifer(320, 19)
-	shape = (8, 320, 16, 32) if is_cuda else (1, 320, 16, 32)
+	block = Classifer(144, 19)
+	shape = (8, 144, 16, 32) if is_cuda else (1, 144, 16, 32)
 	lat3  = measure_latency_in_ms(block, shape, is_cuda)
 	# time.sleep(0.1)
-	latency_lookup['base'] = lat1 + lat2 + lat3 # + 0.1  # 0.1 is the latency rectifier
+	block = PyramidPooling(144)
+	shape = (8, 144, 16, 32) if is_cuda else (1, 144, 16, 32)
+	lat4  = measure_latency_in_ms(block, shape, is_cuda)
+	# time.sleep(0.1)
+	block = _ConvBNReLU(144 * 2, 144, 1)
+	shape = (8, 144 * 2, 16, 32) if is_cuda else (1, 144 * 2, 16, 32)
+	lat5  = measure_latency_in_ms(block, shape, is_cuda)
+	# time.sleep(0.1)
+	latency_lookup['base'] = lat1 + lat2 + lat3 + lat4 + lat5 # + 0.1  # 0.1 is the latency rectifier
 
 
-	# 64x128 cin=64 cout=80 s=2 relu
-	print('64x128 cin=64 cout=80 s=2 relu')
+	print('64x128 cin=64 cout=64 s=2 relu')
 	for idx in range(len(PRIMITIVES)):
 		if (idx == 0) or (idx == 2):
 			continue
@@ -85,100 +92,98 @@ def get_latency_lookup(is_cuda):
 			raise ValueError
 
 		for mc in mc_list:
-			block = OPS[PRIMITIVES[idx]](64, mc, 80, 2, True, 'relu')
-			shape = (16, 64, 64, 128) if is_cuda else (1, 64, 64, 128)
+			block = OPS[PRIMITIVES[idx]](64, mc, 64, 2, True, 'relu')
+			shape = (8, 64, 64, 128) if is_cuda else (1, 64, 64, 128)
 			lat   = measure_latency_in_ms(block, shape, is_cuda)
 			if idx < 4:
-				key = '{}_128_64_0_80_k{}_s2_relu'.format(block.name, block.kernel_size)
+				key = '{}_128_64_0_64_k{}_s2_relu'.format(block.name, block.kernel_size)
 			else:
 				if idx % 2 == 0:
-					key = '{}_128_64_64_80_k{}_s2_relu'.format(block.name, block.kernel_size)
+					key = '{}_128_64_64_64_k{}_s2_relu'.format(block.name, block.kernel_size)
 				else:
-					key = '{}_128_64_128_80_k{}_s2_relu'.format(block.name, block.kernel_size)
+					key = '{}_128_64_128_64_k{}_s2_relu'.format(block.name, block.kernel_size)
 			if key not in latency_lookup:
 				latency_lookup[key] = OrderedDict()
 			latency_lookup[key][block.mid_channels] = lat
 			# time.sleep(0.1)
 
 
-	# 32x64 cin=80 cout=80 s=1 relu
-	print('32x64 cin=80 cout=80 s=1 relu')
+	print('32x64 cin=64 cout=64 s=1 relu')
 	for idx in range(len(PRIMITIVES)):
 		if (idx == 0) or (idx == 2):
 			continue
 
 		op = PRIMITIVES[idx]
 		if op.startswith('MBI') and (idx % 2 == 0):
-			mc_list = list(range(1, 80*4+1))
-			# mc_list = list(range(0, 24*4+1, 8))
+			mc_list = list(range(1, 64*4+1))
+			# mc_list = list(range(0, 16*4+1, 8))
 			# mc_list[0] = 1
 		elif op.startswith('MBI') and (idx % 2 == 1):
-			mc_list = list(range(1, 80*8+1))
-			# mc_list = list(range(0, 24*8+1, 8))
+			mc_list = list(range(1, 64*8+1))
+			# mc_list = list(range(0, 16*8+1, 8))
 			# mc_list[0] = 1
 		elif op.startswith('Bot'):
-			mc_list = list(range(1, 80*2+1))
-			# mc_list = list(range(0, 24*2+1, 8))
+			mc_list = list(range(1, 64*2+1))
+			# mc_list = list(range(0, 16*2+1, 8))
 			# mc_list[0] = 1
 		else:
 			raise ValueError
 
 		for mc in mc_list:
-			block = OPS[PRIMITIVES[idx]](80, mc, 80, 1, True, 'relu')
-			shape = (16, 80, 32, 64) if is_cuda else (1, 80, 32, 64)
+			block = OPS[PRIMITIVES[idx]](64, mc, 64, 1, True, 'relu')
+			shape = (8, 64, 32, 64) if is_cuda else (1, 64, 32, 64)
 			lat   = measure_latency_in_ms(block, shape, is_cuda)
 			if idx < 4:
-				key = '{}_64_80_0_80_k{}_s1_relu'.format(block.name, block.kernel_size)
+				key = '{}_64_64_0_64_k{}_s1_relu'.format(block.name, block.kernel_size)
 			else:
 				if idx % 2 == 0:
-					key = '{}_64_80_80_80_k{}_s1_relu'.format(block.name, block.kernel_size)
+					key = '{}_64_64_64_64_k{}_s1_relu'.format(block.name, block.kernel_size)
 				else:
-					key = '{}_64_80_160_80_k{}_s1_relu'.format(block.name, block.kernel_size)	
+					key = '{}_64_64_128_64_k{}_s1_relu'.format(block.name, block.kernel_size)
 			if key not in latency_lookup:
 				latency_lookup[key] = OrderedDict()
 			latency_lookup[key][block.mid_channels] = lat
 			# time.sleep(0.1)
 
 
-	# 32x64 cin=80 cout=96 s=2 swish
-	print('32x64 cin=80 cout=96 s=2 swish')
+	print('32x64 cin=64 cout=96 s=2 swish')
 	for idx in range(len(PRIMITIVES)):
 		if (idx == 0) or (idx == 2):
 			continue
 
 		op = PRIMITIVES[idx]
 		if op.startswith('MBI') and (idx % 2 == 0):
-			mc_list = list(range(1, 80*4+1))
+			mc_list = list(range(1, 64*4+1))
 			# mc_list = list(range(0, 24*4+1, 8))
 			# mc_list[0] = 1
 		elif op.startswith('MBI') and (idx % 2 == 1):
-			mc_list = list(range(1, 80*8+1))
+			mc_list = list(range(1, 64*8+1))
 			# mc_list = list(range(0, 24*8+1, 8))
 			# mc_list[0] = 1
 		elif op.startswith('Bot'):
-			mc_list = list(range(1, 80*2+1))
+			mc_list = list(range(1, 64*2+1))
 			# mc_list = list(range(0, 24*2+1, 8))
 			# mc_list[0] = 1
 		else:
 			raise ValueError
 
 		for mc in mc_list:
-			block = OPS[PRIMITIVES[idx]](80, mc, 96, 2, True, 'swish')
-			shape = (16, 80, 32, 64) if is_cuda else (1, 80, 32, 64)
+			block = OPS[PRIMITIVES[idx]](64, mc, 96, 2, True, 'swish')
+			shape = (8, 64, 32, 64) if is_cuda else (1, 64, 32, 64)
 			lat   = measure_latency_in_ms(block, shape, is_cuda)
 			if idx < 4:
-				key = '{}_64_80_0_96_k{}_s2_swish'.format(block.name, block.kernel_size)
+				key = '{}_64_64_0_96_k{}_s2_swish'.format(block.name, block.kernel_size)
 			else:
 				if idx % 2 == 0:
-					key = '{}_64_80_80_96_k{}_s2_swish'.format(block.name, block.kernel_size)
+					key = '{}_64_64_64_96_k{}_s2_swish'.format(block.name, block.kernel_size)
 				else:
-					key = '{}_64_80_160_96_k{}_s2_swish'.format(block.name, block.kernel_size)
+					key = '{}_64_64_128_96_k{}_s2_swish'.format(block.name, block.kernel_size)	
 			if key not in latency_lookup:
 				latency_lookup[key] = OrderedDict()
 			latency_lookup[key][block.mid_channels] = lat
 			# time.sleep(0.1)
 
-	# 16x32 cin=96 cout=96 s=1 swish
+
 	print('16x32 cin=96 cout=96 s=1 swish')
 	for idx in range(len(PRIMITIVES)):
 		if (idx == 0) or (idx == 2):
@@ -202,7 +207,7 @@ def get_latency_lookup(is_cuda):
 
 		for mc in mc_list:
 			block = OPS[PRIMITIVES[idx]](96, mc, 96, 1, True, 'swish')
-			shape = (16, 96, 16, 32) if is_cuda else (1, 96, 16, 32)
+			shape = (8, 96, 16, 32) if is_cuda else (1, 96, 16, 32)
 			lat   = measure_latency_in_ms(block, shape, is_cuda)
 			if idx < 4:
 				key = '{}_32_96_0_96_k{}_s1_swish'.format(block.name, block.kernel_size)
@@ -216,8 +221,8 @@ def get_latency_lookup(is_cuda):
 			latency_lookup[key][block.mid_channels] = lat
 			# time.sleep(0.1)
 
-	# 16x32 cin=96 cout=128 s=1 swish
-	print('28x28 cin=40 cout=80 s=2 swish')
+
+	print('16x32 cin=96 cout=128 s=1 swish')
 	for idx in range(len(PRIMITIVES)):
 		if (idx == 0) or (idx == 2):
 			continue
@@ -240,7 +245,7 @@ def get_latency_lookup(is_cuda):
 
 		for mc in mc_list:
 			block = OPS[PRIMITIVES[idx]](96, mc, 128, 1, True, 'swish')
-			shape = (16, 96, 16, 32) if is_cuda else (1, 96, 16, 32)
+			shape = (8, 96, 16, 32) if is_cuda else (1, 96, 16, 32)
 			lat   = measure_latency_in_ms(block, shape, is_cuda)
 			if idx < 4:
 				key = '{}_32_96_0_128_k{}_s1_swish'.format(block.name, block.kernel_size)
@@ -316,7 +321,7 @@ def get_latency_lookup(is_cuda):
 
 		for mc in mc_list:
 			block = OPS[PRIMITIVES[idx]](128, mc, 144, 1, True, 'swish')
-			shape = (16, 128, 16, 32) if is_cuda else (1, 128, 16, 32)
+			shape = (8, 128, 16, 32) if is_cuda else (1, 128, 16, 32)
 			lat   = measure_latency_in_ms(block, shape, is_cuda)
 			if idx < 4:
 				key = '{}_32_128_0_144_k{}_s1_swish'.format(block.name, block.kernel_size)
@@ -368,120 +373,6 @@ def get_latency_lookup(is_cuda):
 			latency_lookup[key][block.mid_channels] = lat
 			# time.sleep(0.1)
 
-	# 16x32 cin=144 cout=192 s=1 swish
-	print('16x32 cin=144 cout=192 s=1 swish')
-	for idx in range(len(PRIMITIVES)):
-		if (idx == 0) or (idx == 2):
-			continue
-
-		op = PRIMITIVES[idx]
-		if op.startswith('MBI') and (idx % 2 == 0):
-			mc_list = list(range(1, 144*4+1))
-			# mc_list = list(range(0, 112*4+1, 8))
-			# mc_list[0] = 1
-		elif op.startswith('MBI') and (idx % 2 == 1):
-			mc_list = list(range(1, 144*8+1))
-			# mc_list = list(range(0, 112*8+1, 8))
-			# mc_list[0] = 1
-		elif op.startswith('Bot'):
-			mc_list = list(range(1, 144*2+1))
-			# mc_list = list(range(0, 112*2+1, 8))
-			# mc_list[0] = 1
-		else:
-			raise ValueError
-
-		for mc in mc_list:
-			block = OPS[PRIMITIVES[idx]](144, mc, 192, 1, True, 'swish')
-			shape = (16, 144, 16, 32) if is_cuda else (1, 144, 16, 32)
-			lat   = measure_latency_in_ms(block, shape, is_cuda)
-			if idx < 4:
-				key = '{}_32_144_0_192_k{}_s1_swish'.format(block.name, block.kernel_size)
-			else:
-				if idx % 2 == 0:
-					key = '{}_32_144_144_192_k{}_s1_swish'.format(block.name, block.kernel_size)
-				else:
-					key = '{}_32_144_288_192_k{}_s1_swish'.format(block.name, block.kernel_size)
-			if key not in latency_lookup:
-				latency_lookup[key] = OrderedDict()
-			latency_lookup[key][block.mid_channels] = lat
-			# time.sleep(0.1)
-
-	# 16x32 cin=192 cout=192 s=1 swish
-	print('16x32 cin=192 cout=192 s=1 swish')
-	for idx in range(len(PRIMITIVES)):
-		if (idx == 0) or (idx == 2):
-			continue
-
-		op = PRIMITIVES[idx]
-		if op.startswith('MBI') and (idx % 2 == 0):
-			mc_list = list(range(1, 192*4+1))
-			# mc_list = list(range(0, 192*4+1, 8))
-			# mc_list[0] = 1
-		elif op.startswith('MBI') and (idx % 2 == 1):
-			mc_list = list(range(1, 192*8+1))
-			# mc_list = list(range(0, 192*8+1, 8))
-			# mc_list[0] = 1
-		elif op.startswith('Bot'):
-			mc_list = list(range(1, 192*2+1))
-			# mc_list = list(range(0, 192*2+1, 8))
-			# mc_list[0] = 1
-		else:
-			raise ValueError
-
-		for mc in mc_list:
-			block = OPS[PRIMITIVES[idx]](192, mc, 192, 1, True, 'swish')
-			shape = (16, 192, 16, 32) if is_cuda else (1, 192, 16, 32)
-			lat   = measure_latency_in_ms(block, shape, is_cuda)
-			if idx < 4:
-				key = '{}_32_192_0_192_k{}_s1_swish'.format(block.name, block.kernel_size)
-			else:
-				if idx % 2 == 0:
-					key = '{}_32_192_192_192_k{}_s1_swish'.format(block.name, block.kernel_size)
-				else:
-					key = '{}_32_192_384_192_k{}_s1_swish'.format(block.name, block.kernel_size)
-			if key not in latency_lookup:
-				latency_lookup[key] = OrderedDict()
-			latency_lookup[key][block.mid_channels] = lat
-			# time.sleep(0.1)
-
-	# 16x32 cin=192 cout=320 s=1 swish
-	print('16x32 cin=192 cout=320 s=1 swish')
-	for idx in range(len(PRIMITIVES)):
-		if (idx == 0) or (idx == 2):
-			continue
-
-		op = PRIMITIVES[idx]
-		if op.startswith('MBI') and (idx % 2 == 0):
-			mc_list = list(range(1, 192*4+1))
-			# mc_list = list(range(0, 192*4+1, 8))
-			# mc_list[0] = 1
-		elif op.startswith('MBI') and (idx % 2 == 1):
-			mc_list = list(range(1, 192*8+1))
-			# mc_list = list(range(0, 192*8+1, 8))
-			# mc_list[0] = 1
-		elif op.startswith('Bot'):
-			mc_list = list(range(1, 192*2+1))
-			# mc_list = list(range(0, 192*2+1, 8))
-			# mc_list[0] = 1
-		else:
-			raise ValueError
-
-		for mc in mc_list:
-			block = OPS[PRIMITIVES[idx]](192, mc, 320, 1, True, 'swish')
-			shape = (16, 192, 16, 32) if is_cuda else (1, 192, 16, 32)
-			lat   = measure_latency_in_ms(block, shape, is_cuda)
-			if idx < 4:
-				key = '{}_32_192_0_320_k{}_s1_swish'.format(block.name, block.kernel_size)
-			else:
-				if idx % 2 == 0:
-					key = '{}_32_192_192_320_k{}_s1_swish'.format(block.name, block.kernel_size)
-				else:
-					key = '{}_32_192_384_320_k{}_s1_swish'.format(block.name, block.kernel_size)
-			if key not in latency_lookup:
-				latency_lookup[key] = OrderedDict()
-			latency_lookup[key][block.mid_channels] = lat
-			# time.sleep(0.1)
-
 	return latency_lookup
 
 
@@ -517,11 +408,11 @@ if __name__ == '__main__':
 	print('measure latency on gpu......')
 	latency_lookup = get_latency_lookup(is_cuda=True)
 	# latency_lookup = convert_latency_lookup(latency_lookup)
-	with open('latency_gpu_seg.pkl', 'wb') as f:
+	with open('latency_gpu_fastscnn.pkl', 'wb') as f:
 		pickle.dump(latency_lookup, f)
 
 	print('measure latency on cpu......')
 	latency_lookup = get_latency_lookup(is_cuda=False)
 	# latency_lookup = convert_latency_lookup(latency_lookup)
-	with open('latency_cpu_seg.pkl', 'wb') as f:
+	with open('latency_cpu_fastscnn.pkl', 'wb') as f:
 		pickle.dump(latency_lookup, f)

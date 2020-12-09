@@ -48,6 +48,7 @@ parser.add_argument('--save', type=str, default='./checkpoints', help='model and
 parser.add_argument('--print_freq', type=float, default=100, help='print frequency')
 parser.add_argument('--workers', type=int, default=4, help='number of workers to load dataset')
 parser.add_argument('--epochs', type=int, default=50, help='num of total training epochs')
+parser.add_argument('--search_epoch', type=int, default=10, help='start epoch for search')
 parser.add_argument('--batch_size', type=int, default=16, help='batch size')
 parser.add_argument('--w_lr', type=float, default=0.025, help='learning rate for weights')
 parser.add_argument('--w_mom', type=float, default=0.9, help='momentum for weights')
@@ -60,6 +61,7 @@ parser.add_argument('--grad_clip', type=float, default=5.0, help='gradient clipp
 parser.add_argument('--T', type=float, default=5.0, help='temperature for gumbel softmax')
 parser.add_argument('--T_decay', type=float, default=0.96, help='temperature decay')
 parser.add_argument('--num_classes', type=int, default=19, help='class number of training set')
+parser.add_argument('--aux', type=bool, default=False, help='aux train for w')
 
 # others
 parser.add_argument('--seed', type=int, default=2, help='random seed')
@@ -106,7 +108,7 @@ def main():
 	mc_maxnum_dddict = get_mc_num_dddict(mc_mask_dddict, is_max=True)
 	if args.distributed or args.num_gpus > 1:
 		dist.init_process_group(backend='nccl', init_method=args.init_method, rank=args.rank, world_size=args.word_size)
-	model = Network(args.num_classes, mc_maxnum_dddict, lat_lookup)
+	model = Network(args.num_classes, mc_maxnum_dddict, lat_lookup, aux=args.aux)
 	model = torch.nn.DataParallel(model).cuda()
 	logging.info("param size = %fMB", count_parameters_in_MB(model))
 
@@ -133,7 +135,7 @@ def main():
 	del optimizer_w
 	del scheduler
 
-	criterion = MixSoftmaxCrossEntropyLoss()
+	criterion = MixSoftmaxCrossEntropyLoss(aux=args.aux)
 	criterion = criterion.cuda()
 
 	input_transform = transforms.Compose([
@@ -144,25 +146,25 @@ def main():
 	train_dataset = get_segmentation_dataset(split='train', mode='train', **data_kwargs)
 	val_dataset = get_segmentation_dataset(split='val', mode='val', **data_kwargs)
 
-	iters_per_epoch = len(train_dataset) // (args.num_gpus * args.batch_size)
-	max_iters = args.epochs * iters_per_epoch
+	# iters_per_epoch = len(train_dataset) // args.batch_size
+	# max_iters = args.epochs * iters_per_epoch
 
-	train_sampler = make_data_sampler(train_dataset, shuffle=True, distributed=args.distributed)
-	train_batch_sampler = make_batch_data_sampler(train_sampler, args.batch_size, iters_per_epoch, drop_last=True)
-	val_sampler = make_data_sampler(val_dataset, shuffle=True, distributed=args.distributed)
-	val_batch_sampler = make_batch_data_sampler(val_sampler, args.batch_size, drop_last=True)
+	# train_sampler = make_data_sampler(train_dataset, shuffle=True, distributed=args.distributed)
+	# train_batch_sampler = make_batch_data_sampler(train_sampler, args.batch_size, iters_per_epoch, drop_last=True)
+	# val_sampler = make_data_sampler(val_dataset, shuffle=True, distributed=args.distributed)
+	# val_batch_sampler = make_batch_data_sampler(val_sampler, args.batch_size, drop_last=True)
 	
 	train_queue = torch.utils.data.DataLoader(
 		dataset=train_dataset,
-		batch_sampler=train_batch_sampler, pin_memory=True, num_workers=args.workers)
+		batch_size=args.batch_size, shuffle=True, pin_memory=True, num_workers=args.workers, drop_last=True)
 
 	val_queue = torch.utils.data.DataLoader(
 		dataset=val_dataset,
-		batch_sampler=val_batch_sampler, pin_memory=True, num_workers=args.workers)
+		batch_size=args.batch_size, shuffle=True, pin_memory=True, num_workers=args.workers, drop_last=True)
 
 	for epoch in range(args.epochs):
 		mc_num_dddict = get_mc_num_dddict(mc_mask_dddict)
-		model = Network(args.num_classes, mc_num_dddict, lat_lookup)
+		model = Network(args.num_classes, mc_num_dddict, lat_lookup, aux=args.aux)
 		model = torch.nn.DataParallel(model).cuda()
 		model.module.set_temperature(args.T)
 
@@ -217,7 +219,7 @@ def main():
 
 		# training
 		epoch_start = time.time()
-		if epoch < 10:
+		if epoch < args.search_epoch:
 			train_acc = train_wo_arch(train_queue, model, criterion, optimizer_w)
 			writer.add_scalar('Train/objs_w', train_acc, epoch)
 		else:
@@ -242,7 +244,7 @@ def main():
 		
 
 		# validation for last 5 epochs
-		if args.epochs - epoch < 10 or epoch >= 10:
+		if args.epochs - epoch < 10 or epoch >= args.search_epoch:
 			val_acc = validate(val_queue, model, criterion, epoch, args)
 			logging.info('Val_acc pixAcc: %f mIoU: %f', val_acc[0], val_acc[1])
 			writer.add_scalar('Val/pixAcc', val_acc[0], epoch)
@@ -276,30 +278,31 @@ def main():
 		del state_dict_from_model, index
 
 		# shrink and expand
-		if epoch >= 10:
+		if epoch >= args.search_epoch:
 			logging.info('Now shrinking or expanding the arch')
 			op_weights, depth_weights = get_op_and_depth_weights(model)
 			parsed_arch = parse_architecture(op_weights, depth_weights)
 			mc_num_dddict = get_mc_num_dddict(mc_mask_dddict)
 			before_lat = get_lookup_latency(parsed_arch, mc_num_dddict, lat_lookup_key_dddict, lat_lookup)
 			logging.info('Before, the current lat: {:.4f}, the target lat: {:.4f}'.format(before_lat, args.target_lat))
+			num_stages = len(mc_mask_dddict)
 
 			if before_lat > args.target_lat:
 				logging.info('Shrinking......')
-				stages = ['stage{}'.format(x) for x in range(1,7)]
+				stages = ['stage{}'.format(x) for x in range(1,num_stages+1)]
 				mc_num_dddict, after_lat = fit_mc_num_by_latency(parsed_arch, mc_num_dddict, mc_maxnum_dddict, 
 														lat_lookup_key_dddict, lat_lookup, args.target_lat, stages, sign=-1)
-				for start in range(2,7):
-					stages = ['stage{}'.format(x) for x in range(start,7)]
+				for start in range(2,num_stages+1):
+					stages = ['stage{}'.format(x) for x in range(start,num_stages+1)]
 					mc_num_dddict, after_lat = fit_mc_num_by_latency(parsed_arch, mc_num_dddict, mc_maxnum_dddict, 
 														lat_lookup_key_dddict, lat_lookup, args.target_lat, stages, sign=1)
 			elif before_lat < args.target_lat:
 				logging.info('Expanding......')
-				stages = ['stage{}'.format(x) for x in range(1,7)]
+				stages = ['stage{}'.format(x) for x in range(1,num_stages+1)]
 				mc_num_dddict, after_lat = fit_mc_num_by_latency(parsed_arch, mc_num_dddict, mc_maxnum_dddict, 
 														lat_lookup_key_dddict, lat_lookup, args.target_lat, stages, sign=1)
-				for start in range(2,7):
-					stages = ['stage{}'.format(x) for x in range(start,7)]
+				for start in range(2,num_stages+1):
+					stages = ['stage{}'.format(x) for x in range(start,num_stages+1)]
 					mc_num_dddict, after_lat = fit_mc_num_by_latency(parsed_arch, mc_num_dddict, mc_maxnum_dddict,
 														lat_lookup_key_dddict, lat_lookup, args.target_lat, stages, sign=1)
 			else:

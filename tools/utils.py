@@ -10,8 +10,8 @@ from torch import distributed as dist
 
 
 def measure_latency_in_ms(model, input_shape, is_cuda):
-	INIT_TIMES = 10
-	LAT_TIMES  = 100
+	INIT_TIMES = 2
+	LAT_TIMES  = 10
 	lat = AverageMeter()
 	model.eval()
 	if(isinstance(input_shape,list)):
@@ -254,4 +254,3 @@ def batch_intersection_union(output, target, nclass):
     area_union = area_pred + area_lab - area_inter
     assert torch.sum(area_inter > area_union).item() == 0, "Intersection area should be smaller than Union area"
     return area_inter.float(), area_union.float()
-

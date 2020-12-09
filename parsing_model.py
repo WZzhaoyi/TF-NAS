@@ -11,7 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.backends.cudnn as cudnn
 
-from models.model_eval import Network
+from models.seg_model_eval import Network
 from tools.utils import measure_latency_in_ms, count_parameters_in_MB
 from tools.flops_benchmark import calculate_FLOPs_in_M
 
@@ -43,12 +43,12 @@ def get_op_and_depth_weights(model_or_path):
 
 def parse_architecture(op_weights, depth_weights):
 	parsed_arch = OrderedDict([
-			('stage1', OrderedDict([('block1', -1), ('block2', -1)])),
+			('stage1', OrderedDict([('block1', -1), ('block2', -1), ('block3', -1)])),
 			('stage2', OrderedDict([('block1', -1), ('block2', -1), ('block3', -1)])),
-			('stage3', OrderedDict([('block1', -1), ('block2', -1), ('block3', -1), ('block4', -1)])),
-			('stage4', OrderedDict([('block1', -1), ('block2', -1), ('block3', -1), ('block4', -1)])),
-			('stage5', OrderedDict([('block1', -1), ('block2', -1), ('block3', -1), ('block4', -1)])),
-			('stage6', OrderedDict([('block1', -1)])),
+			('stage3', OrderedDict([('block1', -1), ('block2', -1), ('block3', -1)])),
+			('stage4', OrderedDict([('block1', -1), ('block2', -1), ('block3', -1)])),
+			# ('stage5', OrderedDict([('block1', -1), ('block2', -1), ('block3', -1), ('block4', -1)])),
+			# ('stage6', OrderedDict([('block1', -1)])),
 		])
 
 	stages = []
@@ -109,9 +109,9 @@ if __name__ == '__main__':
 	x = torch.randn((1, 3, 224, 224))
 	x = x.cuda()
 
-	config = model.config
-	with open(args.save_path, 'w') as f:
-		json.dump(config, f, indent=4)
+	# config = model.config
+	# with open(args.save_path, 'w') as f:
+	# 	json.dump(config, f, indent=4)
 
 	params = count_parameters_in_MB(model)
 	print('Params:  \t{:.4f}MB'.format(params))

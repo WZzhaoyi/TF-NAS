@@ -213,71 +213,68 @@ class MixedStage(nn.Module):
 
 
 class Network(nn.Module):
-	def __init__(self, num_classes, mc_num_dddict, lat_lookup):
+	def __init__(self, num_classes, mc_num_dddict, lat_lookup, aux):
 		super(Network, self).__init__()
 		self.lat_lookup = lat_lookup
 		self.mc_num_dddict = mc_num_dddict
 		self.nclass = num_classes
+		self.aux = aux
 		self.first_stem  = LearningToDownsample(32, 48, 64)
 
 		self.stage1 = MixedStage(
-							ics  = [64,80],
-							ocs  = [80,80],
-							ss   = [2,1],
-							affs = [False, False],
-							acts = ['relu', 'relu'],
+							ics  = [64,64,64],
+							ocs  = [64,64,64],
+							ss   = [2,1,1],
+							affs = [False, False, False, False],
+							acts = ['relu', 'relu', 'relu', 'relu'],
 							mc_num_ddict = mc_num_dddict['stage1'],
 							lat_lookup = lat_lookup,
-							stage_type = 1,)
+							stage_type = 2,)
 		self.stage2 = MixedStage(
-							ics  = [80,96,96],
+							ics  = [64,96,96],
 							ocs  = [96,96,96],
 							ss   = [2,1,1],
-							affs = [False, False, False],
-							acts = ['swish', 'swish', 'swish'],
+							affs = [False, False, False, False],
+							acts = ['swish', 'swish', 'swish', 'swish'],
 							mc_num_ddict = mc_num_dddict['stage2'],
 							lat_lookup = lat_lookup,
 							stage_type = 2,)
 		self.stage3 = MixedStage(
-							ics  = [96,128,128,128],
-							ocs  = [128,128,128,128],
-							ss   = [1,1,1,1],
+							ics  = [96,128,128],
+							ocs  = [128,128,128],
+							ss   = [1,1,1],
 							affs = [False, False, False, False],
 							acts = ['swish', 'swish', 'swish', 'swish'],
 							mc_num_ddict = mc_num_dddict['stage3'],
 							lat_lookup = lat_lookup,
-							stage_type = 3,)
+							stage_type = 2,)
 		self.stage4 = MixedStage(
-							ics  = [128,144,144,144],
-							ocs  = [144,144,144,144],
-							ss   = [1,1,1,1],
+							ics  = [128,144,144],
+							ocs  = [144,144,144],
+							ss   = [1,1,1],
 							affs = [False, False, False, False],
 							acts = ['swish', 'swish', 'swish', 'swish'],
 							mc_num_ddict = mc_num_dddict['stage4'],
 							lat_lookup = lat_lookup,
-							stage_type = 3,)
-		self.stage5 = MixedStage(
-							ics  = [144,192,192,192],
-							ocs  = [192,192,192,192],
-							ss   = [1,1,1,1],
-							affs = [False, False, False, False],
-							acts = ['swish', 'swish', 'swish', 'swish'],
-							mc_num_ddict = mc_num_dddict['stage5'],
-							lat_lookup = lat_lookup,
-							stage_type = 3,)
-		self.stage6 = MixedStage(
-							ics  = [192,],
-							ocs  = [320,],
-							ss   = [1,],
-							affs = [False,],
-							acts = ['swish',],
-							mc_num_ddict = mc_num_dddict['stage6'],
-							lat_lookup = lat_lookup,
-							stage_type = 0,)
-		self.ppm = PyramidPooling(320)
-		self.out = _ConvBNReLU(320 * 2, 320, 1)
-		self.feature_mix_layer = FeatureFusionModule(64, 320, 320)
-		self.classifier = Classifer(320, self.nclass)
+							stage_type = 2,)
+		self.ppm = PyramidPooling(144)
+		self.out = _ConvBNReLU(144 * 2, 144, 1)
+		self.feature_mix_layer = FeatureFusionModule(64, 144, 144)
+		self.classifier = Classifer(144, self.nclass)
+		self.auxlayer1 = nn.Sequential(OrderedDict([
+			('conv1',nn.Conv2d(64, 32, 3, padding=1, bias=False)),
+			('bn',nn.BatchNorm2d(32)),
+			('relu',nn.ReLU(True)),
+			('dropout',nn.Dropout2d(0.1)),
+			('conv2',nn.Conv2d(32, self.nclass, 1))
+		]))
+		self.auxlayer2 = nn.Sequential(OrderedDict([
+			('conv1',nn.Conv2d(144, 32, 3, padding=1, bias=False)),
+			('bn',nn.BatchNorm2d(32)),
+			('relu',nn.ReLU(True)),
+			('dropout',nn.Dropout2d(0.1)),
+			('conv2',nn.Conv2d(32, self.nclass, 1))
+		]))
 
 		self._initialization()
 
@@ -295,17 +292,24 @@ class Network(nn.Module):
 		out_lat += lat
 		x, lat = self.stage4(x, sampling, mode)
 		out_lat += lat
-		x, lat = self.stage5(x, sampling, mode)
-		out_lat += lat
-		x, lat = self.stage6(x, sampling, mode)
-		out_lat += lat
+		# x, lat = self.stage5(x, sampling, mode)
+		# out_lat += lat
+		# x, lat = self.stage6(x, sampling, mode)
+		# out_lat += lat
 		x = self.ppm(x)
 		x = self.out(x)
+		lower_res_features = x
+		
 
 		x = self.feature_mix_layer(higher_res_features, x)
 		x = self.classifier(x)
 		x = F.interpolate(x, size, mode='bilinear', align_corners=True)
-
+		if(self.aux and sampling):
+			auxout1 = self.auxlayer1(higher_res_features)
+			auxout1 = F.interpolate(auxout1, size, mode='bilinear', align_corners=True)
+			auxout2 = self.auxlayer2(lower_res_features)
+			auxout2 = F.interpolate(auxout2, size, mode='bilinear', align_corners=True)
+			return [x, auxout1, auxout2], out_lat
 		return x, out_lat
 
 	def set_temperature(self, T):
